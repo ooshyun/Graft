@@ -17,9 +17,19 @@ import type { Language, WalkCtx } from "./extract.js";
  * lexical position. */
 export class FileBindings {
   private map = new Map<string, string>();
+  /** Every type a key was ever bound to, in insertion order. A field assigned on
+   * both arms of a branch — `self.model = A(...)` / `else: self.model = B(...)`
+   * — genuinely holds either, and keeping only the last would silently pick one
+   * of two equally true answers. `map` still holds the last for the single-type
+   * callers (receiver typing, which must name ONE type to look a method up on). */
+  private all = new Map<string, Set<string>>();
 
   set(scopePath: string, name: string, type: string): void {
-    this.map.set(`${scopePath}|${name}`, type);
+    const key = `${scopePath}|${name}`;
+    this.map.set(key, type);
+    const seen = this.all.get(key);
+    if (seen) seen.add(type);
+    else this.all.set(key, new Set([type]));
   }
 
   /** Innermost-first: for scope ["a","b"] name "x", tries `a.b|x`, `a|x`, `|x`. */
@@ -29,6 +39,16 @@ export class FileBindings {
       if (hit) return hit;
     }
     return null;
+  }
+
+  /** Every type bound at the innermost scope level that has any — see {@link all}.
+   * Empty when the name is unbound. */
+  lookupAll(scope: string[], name: string): string[] {
+    for (let i = scope.length; i >= 0; i--) {
+      const hit = this.all.get(`${scope.slice(0, i).join(".")}|${name}`);
+      if (hit) return [...hit];
+    }
+    return [];
   }
 }
 

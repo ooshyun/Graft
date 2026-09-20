@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { buildGraph } from "../src/graph/build.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
 import { dottedPaths } from "../src/graph/config.js";
+import { checkGraph, formatGraphCheckReport } from "../src/graph/check.js";
 import type { GraphV1 } from "../src/graph/types.js";
 
 const MODEL = `class TFNet:
@@ -200,4 +201,53 @@ test("dottedPaths: shape rule and deduplication", () => {
     "three-plus identifier segments only, each path once",
   );
   assert.equal(found.find((f) => f.path === "a.b.C")!.line, 1, "the first occurrence's line is kept");
+});
+
+test("check: a dotted path under a repo package that resolves to nothing is reported", async () => {
+  const dir = makeFixture({
+    "conf/ok.json": JSON.stringify({ a: "src.models.tfnet.TFNet" }, null, 2),
+    "conf/rot.json": JSON.stringify(
+      {
+        gone: "src.models.tfnet.DeletedClass",
+        moved: "src.compile.collector",
+        third_party: "torch.nn.Module",
+      },
+      null,
+      2,
+    ),
+  });
+  try {
+    await buildGraph(dir);
+    const r = await checkGraph(dir);
+    const paths = r.brokenRefs.map((b) => b.path).sort();
+    assert.deepEqual(
+      paths,
+      ["src.compile.collector", "src.models.tfnet.DeletedClass"],
+      "only paths that point INTO this repo and miss are reported",
+    );
+    assert.ok(
+      r.brokenRefs.every((b) => b.from === "conf/rot.json"),
+      "each is attributed to the config that names it",
+    );
+    assert.ok(
+      r.brokenRefs.every((b) => typeof b.line === "number"),
+      "and to the line it appears on",
+    );
+    assert.equal(r.ok, true, "a rotted config is not graph drift — the graph matches the code");
+    assert.match(formatGraphCheckReport(r), /broken references \(2\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("check: a repo with sound configs reports no broken references", async () => {
+  const dir = makeFixture({ "conf/ok.json": JSON.stringify({ a: "src.models.tfnet.TFNet" }) });
+  try {
+    await buildGraph(dir);
+    const r = await checkGraph(dir);
+    assert.deepEqual(r.brokenRefs, []);
+    assert.doesNotMatch(formatGraphCheckReport(r), /broken references/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

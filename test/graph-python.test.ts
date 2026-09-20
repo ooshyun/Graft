@@ -387,6 +387,41 @@ test("Python: a subscripted call resolves through the container's element type",
   }
 });
 
+test("Python: a field assigned on both arms of a branch reaches both types", async () => {
+  const dir = makeFixture();
+  try {
+    writeFileSync(
+      join(dir, "either.py"),
+      [
+        "from pkg.thing import Widget",
+        "from dup_z import Dup",
+        "",
+        "",
+        "class Either:",
+        "    def __init__(self, flag):",
+        "        if flag:",
+        "            self.impl = Widget()",
+        "        else:",
+        "            self.impl = Dup()",
+        "",
+        "    def run(self):",
+        "        return self.impl()",
+        "",
+      ].join("\n"),
+    );
+    const graph = await buildFixture(dir);
+    const targets = graph.edges
+      .filter((e) => e.relation === "calls" && e.source === "either.py#Either.run")
+      .map((e) => e.target);
+    // Both assignments are in the source; the field really can hold either, so
+    // naming only the last would be a silent choice between two true answers.
+    assert.ok(targets.includes("pkg/thing.py#Widget"), "the if-arm's type is reached");
+    assert.ok(targets.includes("dup_z.py#Dup"), "the else-arm's type is reached too");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Python: a real method outranks a same-named instance field", async () => {
   const dir = makeFixture();
   try {

@@ -799,31 +799,43 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         // both a field and a method of one name still resolves to the method).
         // Normalized to `self.` the way resolveRecvType does, so TS's `this.x()`
         // shares the path.
-        const fieldBase =
+        // `self.x` in Python, `this.x` in TS — each language's binding collector
+        // stores the receiver as its own language spells it, so try both rather
+        // than normalizing one way (resolveRecvType does the same).
+        const fieldBases: string[] =
           callee.viaMember && callee.receiver
-            ? `${callee.receiver === "this" ? "self" : callee.receiver.replace(/^this\./, "self.")}.${callee.name}`
-            : null;
+            ? [...new Set([
+                `${callee.receiver}.${callee.name}`,
+                `${callee.receiver.replace(/^this(\.|$)/, "self$1")}.${callee.name}`,
+              ])]
+            : [];
         // A subscripted call reads the container's ELEMENT type, kept under a
         // separate key so an ordinary `self.layers.foo()` can never see it.
-        const fieldKey = fieldBase && callee.viaSubscript ? `${fieldBase}[]` : fieldBase;
-        const boundType = fieldKey ? ctx.bindings.lookup(ctx.scope, fieldKey) : null;
+        const fieldKeys = callee.viaSubscript ? fieldBases.map((b) => `${b}[]`) : fieldBases;
+        const boundTypes = [...new Set(fieldKeys.flatMap((k) => ctx.bindings.lookupAll(ctx.scope, k)))];
         const withRecv = recvType ? { ...callEdge, recvType } : callEdge;
-        // A member call carries no specifier of its own (that is the bare-call
-        // import path above), so the slot is free to name where the BOUND TYPE
-        // came from. Without it a bound type the repo defines twice — two
-        // `FiLM`s, the case this whole fallback exists for — would resolve
-        // ambiguously and drop, even though this file's import already said
-        // which one it holds.
-        const boundImport = boundType ? ctx.importedSymbols.get(boundType) : undefined;
-        edges.push(
-          boundType
-            ? {
-                ...withRecv,
-                boundType: boundImport?.name ?? boundType,
-                ...(boundImport ? { specifier: boundImport.specifier } : {}),
-              }
-            : withRecv,
-        );
+        if (boundTypes.length === 0) {
+          edges.push(withRecv);
+        } else {
+          // One edge per type the field can hold: a field assigned on both arms
+          // of a branch really can be either, and naming only the last would be
+          // a silent coin-flip between two true answers.
+          //
+          // A member call carries no specifier of its own (that is the bare-call
+          // import path above), so the slot is free to name where the BOUND TYPE
+          // came from. Without it a bound type the repo defines twice — two
+          // `FiLM`s, the case this whole fallback exists for — would resolve
+          // ambiguously and drop, even though this file's import already said
+          // which one it holds.
+          for (const t of boundTypes) {
+            const boundImport = ctx.importedSymbols.get(t);
+            edges.push({
+              ...withRecv,
+              boundType: boundImport?.name ?? t,
+              ...(boundImport ? { specifier: boundImport.specifier } : {}),
+            });
+          }
+        }
       }
     }
   } else if (ctx.lang === "python" && node.type === "string") {

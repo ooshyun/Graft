@@ -23,8 +23,9 @@ import { contextDirFor } from "../context/node-file.js";
 import { extractFile, languageOf } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
-import { configLangOf, extractConfig } from "./config.js";
+import { configLangOf, extractConfig, dottedPaths } from "./config.js";
 import { listSourceFiles } from "./build.js";
+import type { GraphV1 } from "./types.js";
 import { readGraph, wiringPath } from "./write.js";
 import { readFingerprint } from "./fingerprint.js";
 import { readSourceFile } from "../util/source.js";
@@ -46,6 +47,14 @@ export interface GraphCheckResult {
    * coverage figure. A deep build that lost most of its LLM calls (#127) is only
    * distinguishable from a deliberate Tier-1 build by the SHARE that is missing. */
   nodes: number;
+  /** Dotted paths in configuration (or in a dynamic-import string) that LOOK
+   * like they name something in this repo — the first segment matches a real
+   * top-level package directory — but resolve to no module or symbol. A typo
+   * or a component deleted out from under its config: the program will fail at
+   * import time, and nothing else checks it. Reported, never counted as drift:
+   * the graph is in sync with the code either way, and a repo may legitimately
+   * name a path a sibling checkout provides. */
+  brokenRefs: { path: string; from: string; line?: number }[];
 }
 
 export interface GraphCheckOptions {
@@ -72,6 +81,7 @@ export async function checkGraph(
     stale: [],
     pending: 0,
     pendingIds: [],
+    brokenRefs: [],
     nodes: 0,
   };
 
@@ -99,6 +109,8 @@ export async function checkGraph(
     new Set(sourceFiles.map((f) => containerLangOf(f)?.name).filter((n): n is string => !!n)),
   );
   const current = new Map<string, string>(); // id → body_hash
+  /** Config-file text, kept for the broken-reference scan after resolution. */
+  const configSources = new Map<string, string>();
   for (const file of sourceFiles) {
     // The same four-way branch `buildGraph` uses, in the same order. The two must
     // stay in step: a tier the build extracts and the check cannot see reports as
@@ -117,6 +129,7 @@ export async function checkGraph(
     if (source === null) continue; // unsupported encoding (e.g. UTF-16BE)
     const rel = relPosix(root, file);
     try {
+      if (config) configSources.set(rel, source);
       const extracted = lang
         ? extractFile(rel, source, lang)
         : container
@@ -159,12 +172,57 @@ export async function checkGraph(
     arr.sort();
   }
 
+  result.brokenRefs = findBrokenRefs(committed, configSources);
+
   result.ok =
     result.added.length === 0 &&
     result.removed.length === 0 &&
     result.changed.length === 0 &&
     result.stale.length === 0;
   return result;
+}
+
+/**
+ * Dotted paths that name this repo but land nowhere.
+ *
+ * The config tier turns a resolvable path into an edge and drops the rest in
+ * silence — correct for `torch.nn.Module`, wrong for
+ * `src.training.datasets.gone.Dataset`, which is a config still selecting a
+ * component somebody deleted. The two are told apart by the FIRST SEGMENT: if it
+ * names a real top-level package directory in this repo, the path was meant to
+ * point inward, so failing to resolve is a defect rather than a third-party
+ * reference.
+ *
+ * Deliberately not drift. The graph matches the code; it is the configuration
+ * that has rotted, and `graft build` cannot fix it.
+ */
+function findBrokenRefs(
+  graph: GraphV1,
+  configSources: Map<string, string>,
+): GraphCheckResult["brokenRefs"] {
+  const roots = new Set<string>();
+  for (const n of graph.nodes) {
+    const top = n.path.split("/")[0];
+    if (top && top !== n.path) roots.add(top); // a directory, not a root-level file
+  }
+  if (roots.size === 0) return [];
+  const resolved = new Set<string>();
+  for (const e of graph.edges) {
+    if (e.confidence === "string_ref") resolved.add(`${e.source}\0${e.line ?? ""}`);
+  }
+  const out: GraphCheckResult["brokenRefs"] = [];
+  const seen = new Set<string>();
+  for (const [rel, text] of configSources) {
+    for (const { path, line } of dottedPaths(text)) {
+      if (!roots.has(path.split(".")[0])) continue; // third-party or unrelated
+      if (resolved.has(`${rel}\0${line}`)) continue; // this line did produce an edge
+      const key = `${rel}\0${path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ path, from: rel, line });
+    }
+  }
+  return out.sort((a, b) => a.from.localeCompare(b.from) || a.path.localeCompare(b.path));
 }
 
 /** Render a graph-check result as a human-readable report. */
@@ -177,7 +235,7 @@ export function formatGraphCheckReport(r: GraphCheckResult): string {
     // the repo was never deep-built or a deep build failed most of its calls.
     const pct = r.nodes > 0 ? Math.round(((r.nodes - r.pending) / r.nodes) * 100) : 0;
     const note = r.pending ? ` (${formatPendingNote(r, pct)})` : "";
-    return `graph check: OK — the wiring graph is in sync with the code.${note}`;
+    return `graph check: OK — the wiring graph is in sync with the code.${note}${formatBrokenRefs(r)}`;
   }
 
   const lines: string[] = ["graph check: STALE", ""];
@@ -201,6 +259,29 @@ export function formatGraphCheckReport(r: GraphCheckResult): string {
   lines.push("");
   if (structural) lines.push("Run `graft build` to rebuild the structure, then commit graft/.");
   if (r.stale.length) lines.push("Run `graft build --deep` to refresh stale summaries.");
+  return lines.join("\n") + formatBrokenRefs(r);
+}
+
+/** Cap how many broken references are listed, so one rotted config cannot bury
+ * the rest of the report. */
+const BROKEN_SAMPLE = 10;
+
+/**
+ * Broken config references, appended to either verdict.
+ *
+ * Separated from drift on purpose, with its own remedy line: `graft build` fixes
+ * a stale graph, and cannot fix a config naming a class that no longer exists.
+ */
+function formatBrokenRefs(r: GraphCheckResult): string {
+  const refs = r.brokenRefs ?? [];
+  if (refs.length === 0) return "";
+  const lines = ["", "", `broken references (${refs.length}) — a config names something this repo does not define:`];
+  for (const b of refs.slice(0, BROKEN_SAMPLE)) {
+    lines.push(`  ? ${b.path}  (${b.from}${b.line ? `:${b.line}` : ""})`);
+  }
+  if (refs.length > BROKEN_SAMPLE) lines.push(`  … +${refs.length - BROKEN_SAMPLE} more`);
+  lines.push("");
+  lines.push("Not graph drift — the graph matches the code. Fix the path, or the component it names.");
   return lines.join("\n");
 }
 
