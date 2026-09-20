@@ -246,6 +246,35 @@ test("Python: a package-relative import resolves against the importing file's pa
   }
 });
 
+test("Python: a call edge records the line of the call, not of a mention above it", async () => {
+  const dir = makeFixture();
+  try {
+    // A docstring and a comment both name `Widget` before the real call, which is
+    // what a name-search for the evidence line would find first.
+    writeFileSync(
+      join(dir, "quoted.py"),
+      [
+        "from pkg.thing import Widget",
+        "",
+        "",
+        "def make():",
+        '    """Build a Widget for the caller."""',
+        "    # Widget is constructed below",
+        "    return Widget()",
+        "",
+      ].join("\n"),
+    );
+    const graph = await buildFixture(dir);
+    const edge = graph.edges.find(
+      (e) => e.relation === "calls" && e.source === "quoted.py#make" && e.target === "pkg/thing.py#Widget",
+    );
+    assert.ok(edge, "make should call Widget");
+    assert.equal(edge!.line, 7, "the recorded line is the call, not the docstring (5) or comment (6)");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Python: a bare call with no import naming it still drops when ambiguous", async () => {
   const dir = makeFixture();
   try {

@@ -95,10 +95,19 @@ export function referenceLine(
   span: string,
   needles: RegExp[],
   read: (path: string) => string[] | null,
+  /** The exact line the edge came from, when the graph recorded one. Searching
+   * for the name is a fallback: it returns the first line that *mentions* the
+   * symbol, which is a docstring or a `# Foo layers` comment whenever one sits
+   * above the real call. */
+  known?: number,
 ): { n: number; text: string } | null {
   const range = spanRange(span);
   const lines = read(path);
   if (!range || !lines) return null;
+  if (known !== undefined && known >= range.start && known <= range.end) {
+    const text = lines[known - 1];
+    if (text !== undefined) return { n: known, text };
+  }
   for (const [i, text] of lines.slice(range.start - 1, range.end).entries()) {
     if (needles.some((re) => re.test(text))) return { n: range.start + i, text };
   }

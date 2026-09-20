@@ -108,6 +108,9 @@ export interface RawEdge {
    * "function", so without this override every such call would be
    * unconditionally unresolvable rather than just occasionally ambiguous. */
   kinds?: Kind[];
+  /** 1-based line of the syntax node that produced this edge, for quoting the
+   * real site rather than the first line whose text happens to name the symbol. */
+  line?: number;
   /** calls: the number of arguments at the CALL SITE. Only emitted for languages
    * with overloading (Java, Swift), where a same-named sibling on the same class is
    * otherwise indistinguishable — and picking wrong turns a delegating overload
@@ -736,6 +739,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         name: importedTarget?.name ?? callee.name,
         viaMember: callee.viaMember,
         file: ctx.rel,
+        line: node.startPosition.row + 1,
         ...(importedTarget ? { specifier: importedTarget.specifier } : {}),
         ...(callee.kinds ? { kinds: callee.kinds } : {}),
       };
@@ -801,6 +805,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         name: imported.name,
         specifier: imported.specifier,
         file: ctx.rel,
+        line: node.startPosition.row + 1,
       });
     }
   }

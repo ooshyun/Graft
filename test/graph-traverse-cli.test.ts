@@ -180,6 +180,39 @@ test('an imported name resolves to the module it was imported from, not to its s
   assert.match(r.stdout, /shared · function · src\/b\.ts[\s\S]*?no indexed callers/);
 });
 
+function docstringRepo(): string {
+  const d = mkdtempSync(join(tmpdir(), 'graft-traversecli-docstring-'));
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src', 'widget.py'), 'class Widget:\n    pass\n');
+  // Both a docstring and a comment name `Widget` above the call that really
+  // constructs it — a name-search for the evidence line stops at the docstring.
+  writeFileSync(
+    join(d, 'src', 'use.py'),
+    [
+      'from src.widget import Widget',
+      '',
+      '',
+      'def build():',
+      '    """Build a Widget."""',
+      '    # Widget goes here',
+      '    return Widget()',
+      '',
+    ].join('\n'),
+  );
+  execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'build', d], { stdio: 'pipe' });
+  return d;
+}
+
+test('graft callers quotes the call site, not a docstring or comment that names the symbol', () => {
+  const d = docstringRepo();
+  const r = runCli(['callers', 'Widget', d]);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /← build \(/);
+  assert.match(r.stdout, /\b7: return Widget\(\)/, 'the quoted line is the call');
+  assert.doesNotMatch(r.stdout, /"""Build a Widget\."""/, 'the docstring must not be quoted');
+  assert.doesNotMatch(r.stdout, /# Widget goes here/, 'the comment must not be quoted');
+});
+
 test('graft callers --depth: depth flag walks the BFS transitively (blast radius)', () => {
   const d = builtRepo();
   // compute -> sub -> add: callers of `add` at depth 1 is just `sub`;

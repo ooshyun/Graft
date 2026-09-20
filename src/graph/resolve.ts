@@ -208,11 +208,21 @@ export function resolveEdges(
 
   const out: EdgeV1[] = [];
   const seen = new Set<string>();
-  const add = (source: string, target: string, relation: Relation, confidence: EdgeV1["confidence"]) => {
+  // `line` is the site that produced the edge. Several sites can collapse into
+  // one edge (a symbol calling another twice); the first wins, matching the
+  // dedup rule below — a reader wants *a* real site, and the earliest is the
+  // one a top-down scan of the source would reach first.
+  const add = (
+    source: string,
+    target: string,
+    relation: Relation,
+    confidence: EdgeV1["confidence"],
+    line?: number,
+  ) => {
     const key = `${source}\0${relation}\0${target}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ source, target, relation, confidence });
+    out.push({ source, target, relation, confidence, ...(line !== undefined ? { line } : {}) });
   };
 
   for (const e of rawEdges) {
@@ -253,12 +263,12 @@ export function resolveEdges(
             : resolveImport(e.specifier, e.file, byId);
         if (!byId.has(targetFile)) continue; // external or unresolved module
         const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
-        if (candidates.length === 1) add(e.source, candidates[0].id, "references", "extracted");
+        if (candidates.length === 1) add(e.source, candidates[0].id, "references", "extracted", e.line);
       } else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
         // PHP attribute without a `use` import (same-file or globally unique class).
         const refKinds: Kind[] = ["class", "interface", "trait", "enum"];
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
-        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence, e.line);
       } else if (e.file.endsWith(".java") && byId.get(e.source)?.origin === "ast") {
         // Java annotation without a specifier (same-file or globally unique
         // `@interface`). Annotation types are `interface` kind — a class of the
@@ -273,8 +283,8 @@ export function resolveEdges(
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
         const anno = hit ? byId.get(hit.id) : undefined;
         if (hit && hit.id !== e.source && anno?.signature?.includes("@interface"))
-          add(e.source, hit.id, "references", hit.confidence);
-        else add(e.source, e.name, "references", "inferred");
+          add(e.source, hit.id, "references", hit.confidence, e.line);
+        else add(e.source, e.name, "references", "inferred", e.line);
       } else if (byId.get(e.source)?.origin === "generic") {
         // Breadth tier: a bare-name structural reference (extends / implements /
         // object-creation / module alias) the grammar marked but cannot type. Resolve
@@ -283,7 +293,7 @@ export function resolveEdges(
         // provably untouched.
         const refKinds: Kind[] = ["class", "interface", "struct", "enum", "type", "module"];
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
-        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence, e.line);
       }
     } else if (e.relation === "calls") {
       if (e.viaMember) {
@@ -291,7 +301,7 @@ export function resolveEdges(
         const hit = resolveTypedMember(e.recvType, e.name!, e.file, ownerMethod, classParents, classTraits, e.argCount);
         if (hit === "ambiguous") continue; // drop — never guess past an ambiguous owner
         if (hit) {
-          add(e.source, hit.id, "calls", hit.confidence);
+          add(e.source, hit.id, "calls", hit.confidence, e.line);
           continue;
         }
         // No owner-qualified match means the call is unresolved. A unique bare
@@ -344,7 +354,7 @@ export function resolveEdges(
             IMPORTED_CALL_KINDS.includes(n.kind),
           );
           if (candidates.length === 1) {
-            add(e.source, candidates[0].id, "calls", "extracted");
+            add(e.source, candidates[0].id, "calls", "extracted", e.line);
             continue;
           }
         }
@@ -370,7 +380,7 @@ export function resolveEdges(
       if (!hit && SWIFT_EXT.test(e.file)) {
         hit = resolveName(e.name!, e.file, SWIFT_CTOR_KINDS, perFileName, globalName);
       }
-      if (hit) add(e.source, hit.id, "calls", hit.confidence); // drop unresolved calls (too noisy)
+      if (hit) add(e.source, hit.id, "calls", hit.confidence, e.line); // drop unresolved calls (too noisy)
     }
   }
   return out;

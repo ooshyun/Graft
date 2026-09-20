@@ -105,6 +105,13 @@ export interface EdgeV1 {
   target: string; // node id, or an unresolved module string for imports
   relation: Relation;
   confidence: Confidence;
+  /** 1-based line of the site that produced this edge (the call, the import),
+   * when the extractor knew it. Optional: generic-tier and synthesized edges
+   * have no single site, and graphs written before this field exist. Readers
+   * use it to quote the real line instead of searching the source span for the
+   * symbol's name, which finds a docstring or comment that merely mentions it.
+   * Where one symbol reaches another from several sites, this is the first. */
+  line?: number;
 }
 
 /** A ranking scope: a sub-project discovered by project-marker files (`package.json`,
