@@ -722,12 +722,21 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
     const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
     if (callee) {
+      // A bare call to a name this file imported by name (`from m import Foo`
+      // → `Foo()`) states its own target: the module it came from and the
+      // exported name. Passing the specifier along lets resolve.ts scope the
+      // lookup to that one file, so a same-named definition elsewhere in the
+      // repo neither steals the edge nor makes the name "ambiguous" and drops
+      // it. Members are excluded — `obj.Foo()` is a method call whose receiver
+      // type, not the import table, names the target.
+      const importedTarget = callee.viaMember ? undefined : ctx.importedSymbols.get(callee.name);
       const callEdge: RawEdge = {
         source: ctx.parentId,
         relation: "calls",
-        name: callee.name,
+        name: importedTarget?.name ?? callee.name,
         viaMember: callee.viaMember,
         file: ctx.rel,
+        ...(importedTarget ? { specifier: importedTarget.specifier } : {}),
         ...(callee.kinds ? { kinds: callee.kinds } : {}),
       };
       // Overloading languages: the call site's argument count, to pick the right
@@ -872,7 +881,64 @@ function collectImportedSymbols(
     return out;
   }
   if (lang === "php") return collectPhpImportedSymbols(root);
+  if (lang === "python") return collectPythonImportedSymbols(root);
   return new Map();
+}
+
+/**
+ * Python `from mod import Name [as alias]` bindings: local alias → { exported
+ * name, module specifier }.
+ *
+ * Only `from … import …` is collected. A plain `import pkg.mod` binds the
+ * package root, not a symbol, so a later bare use of `pkg` names a module
+ * rather than a definition — wiring it would require guessing which member was
+ * meant. A wildcard (`from mod import *`) states no name at all and is skipped
+ * for the same reason.
+ *
+ * The specifier is kept verbatim (`src.models.common.film`, `.film`, `..common`)
+ * and resolved to a file in resolve.ts, which is where module-path semantics and
+ * the node index live.
+ */
+function collectPythonImportedSymbols(
+  root: Parser.SyntaxNode,
+): Map<string, { name: string; specifier: string }> {
+  const out = new Map<string, { name: string; specifier: string }>();
+  const visit = (node: Parser.SyntaxNode): void => {
+    if (node.type === "import_from_statement") {
+      const specifier = importSpecifier(node, "python");
+      if (specifier) collectPythonFromImport(node, specifier, out);
+      return;
+    }
+    for (const child of node.namedChildren) visit(child);
+  };
+  visit(root);
+  return out;
+}
+
+function collectPythonFromImport(
+  node: Parser.SyntaxNode,
+  specifier: string,
+  out: Map<string, { name: string; specifier: string }>,
+): void {
+  // The module name is also a `dotted_name` child, so skip whichever node the
+  // `module_name` field points at rather than matching on text.
+  const moduleNode = node.childForFieldName("module_name");
+  for (const child of node.namedChildren) {
+    if (child.id === moduleNode?.id) continue;
+    if (child.type === "dotted_name") {
+      // `from m import Name` — a plain name; a dotted one (`from m import a.b`)
+      // is not valid Python, so the first segment is the whole name.
+      const name = child.namedChildren[0]?.text ?? child.text;
+      if (name) out.set(name, { name, specifier });
+    } else if (child.type === "aliased_import") {
+      const nameNode = child.childForFieldName("name");
+      const aliasNode = child.childForFieldName("alias");
+      const name = nameNode?.namedChildren[0]?.text ?? nameNode?.text;
+      const alias = aliasNode?.text;
+      if (name && alias) out.set(alias, { name, specifier });
+      else if (name) out.set(name, { name, specifier });
+    }
+  }
 }
 
 /** PHP `use` bindings: local alias → { exported name, FQN specifier }. */

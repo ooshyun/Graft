@@ -27,6 +27,11 @@ const PY_EXT = /\.pyi?$/i;
  * construction. Only `class` — Python enums, dataclasses and NamedTuples are all
  * classes, so no other kind is reachable this way. */
 const PY_CTOR_KINDS: Kind[] = ["class"];
+/** What a call to an imported name may target. The import pins the file, so the
+ * function-vs-type split the repo-wide path has to make (see PY_CTOR_KINDS) does
+ * not arise: whichever of the two that file exports under the name is the target.
+ * Callable values only — a call is never to a plain variable. */
+const IMPORTED_CALL_KINDS: Kind[] = ["function", "class", "method"];
 /** Swift is Python's case with more nominal kinds: `Animal(legs: 4)` is an ordinary
  * call node with no `new` to mark construction, and struct/enum initializers are as
  * routine as class ones (a struct gets a memberwise init for free). Same fallback
@@ -128,6 +133,11 @@ export function resolveEdges(
   // node ids. A `use App\Models\User` names a PSR-4 class whose file mirrors the namespace
   // tail under some (unknown) source root, so the suffix is the portable key.
   const phpFilesBySuffix = new Map<string, string[]>();
+  // Python module resolution: a file's path-suffix (`models/common/film.py`,
+  // `common/film.py`, …) → its file node ids. An absolute dotted import names a
+  // module relative to some (unknown) package root, so the suffix is the portable
+  // key — same reasoning as Java/PHP above.
+  const pyFilesBySuffix = new Map<string, string[]>();
   const hasGoModules = !!opts.goModules?.length;
   for (const n of nodes) {
     if (n.kind === "file") {
@@ -149,6 +159,10 @@ export function resolveEdges(
       if (n.path.endsWith(".php")) {
         const parts = toPosixPath(n.path).split("/");
         for (let i = 0; i < parts.length; i++) push(phpFilesBySuffix, parts.slice(i).join("/"), n.id);
+      }
+      if (PY_EXT.test(n.path)) {
+        const parts = toPosixPath(n.path).split("/");
+        for (let i = 0; i < parts.length; i++) push(pyFilesBySuffix, parts.slice(i).join("/"), n.id);
       }
       {
         const p = toPosixPath(n.path);
@@ -216,7 +230,9 @@ export function resolveEdges(
                 ? resolveRustUse(e.specifier, e.file, byId, rustCrateRoots)
                 : e.file.endsWith(".php")
                   ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-                  : resolveImport(e.specifier, e.file, byId);
+                  : PY_EXT.test(e.file)
+                    ? resolvePythonImport(e.specifier, e.file, byId, pyFilesBySuffix)
+                    : resolveImport(e.specifier, e.file, byId);
       add(e.source, target, "imports", "extracted");
     } else if (e.relation === "extends" || e.relation === "implements") {
       // `implements` also resolves to a `trait` — PHP models trait composition
@@ -232,7 +248,9 @@ export function resolveEdges(
         // same-named symbol elsewhere in the repo cannot become a false edge.
         const targetFile = e.file.endsWith(".php")
           ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-          : resolveImport(e.specifier, e.file, byId);
+          : PY_EXT.test(e.file)
+            ? resolvePythonImport(e.specifier, e.file, byId, pyFilesBySuffix)
+            : resolveImport(e.specifier, e.file, byId);
         if (!byId.has(targetFile)) continue; // external or unresolved module
         const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
         if (candidates.length === 1) add(e.source, candidates[0].id, "references", "extracted");
@@ -309,6 +327,28 @@ export function resolveEdges(
       //
       // R (depth tier, Phase 4) sets `e.kinds` itself for an untyped `obj$method()`
       // (see above), and that explicit choice wins over the per-tier default.
+      // An import-named target resolves against the module it was imported
+      // from, not against the repo. `from m import Foo` + `Foo()` states both
+      // halves — the file and the exported name — so the lookup is scoped to
+      // that one file. This is the same soundness argument the `references`
+      // branch above makes, and it is what lets a name that several files
+      // define still resolve here: the import already chose between them, so
+      // there is nothing to guess. Unresolved (external module, or not unique
+      // in the target file) falls through to the repo-wide path below.
+      if (e.specifier) {
+        const targetFile = PY_EXT.test(e.file)
+          ? resolvePythonImport(e.specifier, e.file, byId, pyFilesBySuffix)
+          : resolveImport(e.specifier, e.file, byId);
+        if (byId.has(targetFile)) {
+          const candidates = (perFileName.get(targetFile)?.get(e.name!) ?? []).filter((n) =>
+            IMPORTED_CALL_KINDS.includes(n.kind),
+          );
+          if (candidates.length === 1) {
+            add(e.source, candidates[0].id, "calls", "extracted");
+            continue;
+          }
+        }
+      }
       const srcOrigin = byId.get(e.source)?.origin;
       const callKinds: Kind[] =
         e.kinds ??
@@ -504,6 +544,55 @@ function resolveImport(spec: string, file: string, byId: Map<string, NodeV1>): s
     ...IMPORT_EXTS.map((e) => `${noExt}/index${e}`),
   ];
   for (const c of candidates) if (byId.has(c)) return c;
+  return spec;
+}
+
+/**
+ * Resolve a Python import specifier to an in-repo file node id; otherwise return
+ * the raw specifier (stdlib or third-party module).
+ *
+ * Python names a module by a dotted path, not a file path, so `resolveImport`'s
+ * relative-path logic never applies: `src.models.common.film` does not start with
+ * a dot, and `.film` is a package-relative name rather than `./film`. Both shapes
+ * are handled here.
+ *
+ *   - absolute (`a.b.c`)  → `a/b/c.py`, else `a/b/c/__init__.py`, else a unique
+ *     path SUFFIX match, since the package root need not be the repo root
+ *     (`src/` layouts, a package nested under `backend/`, …).
+ *   - relative (`.mod`, `..pkg.mod`) → resolved against the importing file's
+ *     directory: one leading dot is the current package, each extra dot climbs one.
+ *
+ * A suffix shared by two files is ambiguous and stays unresolved rather than
+ * guessing, matching resolveJavaImport.
+ */
+function resolvePythonImport(
+  spec: string,
+  file: string,
+  byId: Map<string, NodeV1>,
+  filesBySuffix: Map<string, string[]>,
+): string {
+  const asFile = (base: string): string | null => {
+    for (const cand of [`${base}.py`, `${base}.pyi`, `${base}/__init__.py`, `${base}/__init__.pyi`]) {
+      if (byId.has(cand)) return cand;
+    }
+    return null;
+  };
+  const dots = /^\.+/.exec(spec)?.[0].length ?? 0;
+  if (dots > 0) {
+    const tail = spec.slice(dots);
+    let dir = posix.dirname(toPosixPath(file));
+    for (let i = 1; i < dots; i++) dir = posix.dirname(dir);
+    const base = tail ? posix.join(dir, tail.split(".").join("/")) : dir;
+    // `from . import x` names the package itself; its `__init__` is the file.
+    return asFile(posix.normalize(base)) ?? (tail ? spec : (asFile(posix.normalize(dir)) ?? spec));
+  }
+  const rel = spec.split(".").join("/");
+  const direct = asFile(rel);
+  if (direct) return direct;
+  for (const suffix of [`${rel}.py`, `${rel}.pyi`, `${rel}/__init__.py`, `${rel}/__init__.pyi`]) {
+    const files = filesBySuffix.get(suffix);
+    if (files && files.length === 1) return files[0];
+  }
   return spec;
 }
 

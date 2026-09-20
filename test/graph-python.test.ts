@@ -191,3 +191,73 @@ test("Python: an ambiguous class name is never guessed at", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Python: a same-named class resolves to the module it was imported from", async () => {
+  const dir = makeFixture();
+  try {
+    const graph = await buildFixture(dir);
+    const edge = graph.edges.find(
+      (e) => e.relation === "calls" && e.source === "caller.py#use_dup" && e.target === "dup_z.py#Dup",
+    );
+    // `Dup` is defined in dup_a.py and dup_z.py; `caller.py` imports dup_z's.
+    // The import names both halves — module and exported name — so the target
+    // is stated, not guessed, and the repo-wide ambiguity never arises.
+    assert.ok(edge, "Dup() should resolve to dup_z, the module caller.py imports");
+    assert.equal(edge!.confidence, "extracted", "an import-named target is certain, not inferred");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Python: an aliased import resolves under its local alias", async () => {
+  const dir = makeFixture();
+  try {
+    writeFileSync(join(dir, "aliased.py"), "from dup_z import Dup as Renamed\n\n\ndef use():\n    return Renamed()\n");
+    const graph = await buildFixture(dir);
+    assert.ok(
+      graph.edges.some(
+        (e) => e.relation === "calls" && e.source === "aliased.py#use" && e.target === "dup_z.py#Dup",
+      ),
+      "Renamed() should resolve to the aliased class's real definition",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Python: a package-relative import resolves against the importing file's package", async () => {
+  const dir = makeFixture();
+  try {
+    // `pkg/sibling.py` imports from `pkg/thing.py` with a single leading dot.
+    writeFileSync(
+      join(dir, "pkg", "sibling.py"),
+      "from .thing import Widget\n\n\ndef make():\n    return Widget()\n",
+    );
+    const graph = await buildFixture(dir);
+    assert.ok(
+      graph.edges.some(
+        (e) =>
+          e.relation === "calls" && e.source === "pkg/sibling.py#make" && e.target === "pkg/thing.py#Widget",
+      ),
+      "`from .thing import Widget` should resolve to the sibling module in the same package",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Python: a bare call with no import naming it still drops when ambiguous", async () => {
+  const dir = makeFixture();
+  try {
+    // No import at all: the call site states only a name two files define, so
+    // there is nothing to resolve against and the drop rule stands.
+    writeFileSync(join(dir, "noimport.py"), "def use():\n    return Dup()\n");
+    const graph = await buildFixture(dir);
+    const targets = graph.edges
+      .filter((e) => e.relation === "calls" && e.source === "noimport.py#use")
+      .map((e) => e.target);
+    assert.deepEqual(targets, [], "an unimported ambiguous name must stay unresolved");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

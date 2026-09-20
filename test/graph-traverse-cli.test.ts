@@ -114,9 +114,29 @@ function ambiguousRepo(): string {
   mkdirSync(join(d, 'src'), { recursive: true });
   writeFileSync(join(d, 'src', 'a.ts'), 'export function shared(): number {\n  return 1;\n}\n');
   writeFileSync(join(d, 'src', 'b.ts'), 'export function shared(): number {\n  return 2;\n}\n');
-  // A cross-file call to the ambiguous name — resolve.ts drops it rather than
-  // guessing which `shared` it means, so NEITHER definition gets a caller edge.
-  writeFileSync(join(d, 'src', 'user.ts'), 'import { shared } from "./a.js";\nexport function use(): number {\n  return shared();\n}\n');
+  // A cross-file call to the ambiguous name with NOTHING naming its target —
+  // no import, so the call site states only a bare name that two files define.
+  // resolve.ts drops it rather than guessing, so NEITHER definition gets a
+  // caller edge. (Add an import and the ambiguity is gone — see
+  // `importedAmbiguousRepo` below, where the import picks the target.)
+  writeFileSync(
+    join(d, 'src', 'user.ts'),
+    'declare function shared(): number;\nexport function use(): number {\n  return shared();\n}\n',
+  );
+  execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'build', d], { stdio: 'pipe' });
+  return d;
+}
+
+/** The same two same-named definitions, but the caller imports one by name. */
+function importedAmbiguousRepo(): string {
+  const d = mkdtempSync(join(tmpdir(), 'graft-traversecli-imported-'));
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src', 'a.ts'), 'export function shared(): number {\n  return 1;\n}\n');
+  writeFileSync(join(d, 'src', 'b.ts'), 'export function shared(): number {\n  return 2;\n}\n');
+  writeFileSync(
+    join(d, 'src', 'user.ts'),
+    'import { shared } from "./a.js";\nexport function use(): number {\n  return shared();\n}\n',
+  );
   execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'build', d], { stdio: 'pipe' });
   return d;
 }
@@ -143,6 +163,21 @@ test('A6 --json: the ambiguous-name note includes the candidate count', () => {
     assert.match(m.note, /2 definitions share the name/);
     assert.match(m.note, /dropped rather than guessed/);
   }
+});
+
+test('an imported name resolves to the module it was imported from, not to its same-named twin', () => {
+  const d = importedAmbiguousRepo();
+  const r = runCli(['callers', 'shared', d]);
+  assert.equal(r.status, 0);
+  // Both definitions are still reported as candidates…
+  assert.equal((r.stdout.match(/shared · function · src\//g) ?? []).length, 2);
+  // …but only the imported one (a.ts) owns the caller edge, and it is the ONLY
+  // caller block: `import { shared } from "./a.js"` states the target, so there
+  // is nothing left to guess between the two definitions.
+  assert.equal((r.stdout.match(/← use \(/g) ?? []).length, 1);
+  assert.match(r.stdout, /shared · function · src\/a\.ts[\s\S]*?← use \(src\/user\.ts/);
+  // b.ts keeps its zero-hit note — it is genuinely uncalled.
+  assert.match(r.stdout, /shared · function · src\/b\.ts[\s\S]*?no indexed callers/);
 });
 
 test('graft callers --depth: depth flag walks the BFS transitively (blast radius)', () => {
