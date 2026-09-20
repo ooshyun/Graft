@@ -35,7 +35,15 @@ export interface LspEnrichResult { added: number; queried: number; server: strin
 export async function enrichWithLsp(
   graph: GraphV1,
   root: string,
-  opts: { onProgress?: (done: number, total: number) => void; maxNodes?: number } = {},
+  opts: {
+    onProgress?: (done: number, total: number) => void;
+    maxNodes?: number;
+    /** Query only callables defined in these repo-relative files. The caller
+     * carries the previous run's edges over for everything else, which is what
+     * makes an incremental build's enrichment cost the files that changed
+     * rather than the whole repo. Absent → every file, the cold-build path. */
+    onlyFiles?: ReadonlySet<string>;
+  } = {},
 ): Promise<LspEnrichResult> {
   const languagesPresent = new Set<string>();
   for (const n of graph.nodes) { const l = langOf(n.path); if (l) languagesPresent.add(l); }
@@ -68,8 +76,17 @@ export async function enrichWithLsp(
 
   // Source nodes to query: callable nodes in files this server handles.
   const serverLangs = new Set(server.languages);
-  let sources = graph.nodes.filter((n) => CALLABLE.has(n.kind) && serverLangs.has(langOf(n.path) ?? ""));
+  let sources = graph.nodes.filter(
+    (n) =>
+      CALLABLE.has(n.kind) &&
+      serverLangs.has(langOf(n.path) ?? "") &&
+      (!opts.onlyFiles || opts.onlyFiles.has(n.path)),
+  );
   if (opts.maxNodes && sources.length > opts.maxNodes) sources = sources.slice(0, opts.maxNodes);
+  // Nothing to ask about (an incremental build whose changed files hold no
+  // callable this server handles) — starting a server to ask zero questions is
+  // pure latency on the query path.
+  if (sources.length === 0) return { added: 0, queried: 0, server: server.command };
 
   const client = new LspClient(server.command, server.args, root, server.languageId);
   if (!(await client.initialize())) { await client.dispose(); return { added: 0, queried: 0, server: server.command }; }

@@ -331,7 +331,12 @@ program
   .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".ts" ".py"); an extension with no parser is ignored with a warning that lists the supported set')
   .option("-j, --concurrency <n>", "files summarized in parallel during --deep (default 5)")
   .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
-  .option("--lsp", "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd)")
+  .option(
+    "--lsp",
+    "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd); " +
+      "persisted for later builds and automatic refreshes, so the edges survive an edit",
+  )
+  .option("--no-lsp", "skip language-server enrichment; persisted for later builds and automatic refreshes (default)")
   .option("--allow-partial", "with --deep: exit 0 even when some files' summaries failed (default: a degraded meaning tier exits 1)")
   .option(
     "--follow-submodules",
@@ -440,6 +445,14 @@ program
     const followNestedReposWasExplicit = command.getOptionValueSource("followNestedRepos") === "cli";
     if (followNestedReposWasExplicit && typeof opts.followNestedRepos === "boolean") {
       buildConfigPatch.followNestedRepos = opts.followNestedRepos;
+    }
+    // Same reasoning as the walk options above, for the same reason it matters
+    // more here: the refresh behind every query rebuilds the graph with no CLI
+    // flags, so an unpersisted `--lsp` lasted exactly until the next edit and
+    // then vanished along with every edge it had contributed.
+    const lspWasExplicit = command.getOptionValueSource("lsp") === "cli";
+    if (lspWasExplicit && typeof opts.lsp === "boolean") {
+      buildConfigPatch.lsp = opts.lsp;
     }
     if (Object.keys(buildConfigPatch).length > 0) {
       patchBuildConfig(resolve(dir), buildConfigPatch);

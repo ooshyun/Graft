@@ -102,6 +102,13 @@ export interface BuildConfig {
    * checkout someone parked in the tree. Absent/false keeps the historical
    * boundary. */
   followNestedRepos?: boolean;
+  /** Whether builds of this repo run the opt-in language-server enrichment
+   * (`graft build --lsp`). Persisted for the same reason as the walk options
+   * above: the automatic refresh behind every query never sees a CLI flag, so
+   * without this each refresh rebuilt the graph WITHOUT the compiler-grade
+   * edges and silently dropped every one the last `--lsp` build had added.
+   * Absent/false keeps the historical default (no language server). */
+  lsp?: boolean;
   /** The Trail brain this repo's rules come from: the brain id and the token to
    * read it with. Persisted here — in the git-ignored `.graft/` — rather than in
    * `~/.graft/`, because a brain belongs to one repository and two checkouts on
@@ -157,6 +164,12 @@ export function readIncludeDirs(d: string): Set<string> | undefined {
 /** Missing and explicit false both retain the backwards-compatible default. */
 export function readFollowSubmodules(d: string): boolean {
   return readBuildConfig(d)?.followSubmodules === true;
+}
+
+/** The persisted `--lsp` choice for repo `d`. Missing and explicit false both
+ * mean "no language server", the backwards-compatible default. */
+export function readLsp(d: string): boolean {
+  return readBuildConfig(d)?.lsp === true;
 }
 
 /** Missing and explicit false both retain the backwards-compatible default. */

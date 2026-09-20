@@ -23,7 +23,7 @@ import { containerLangOf, extractContainer, warmContainerGrammars } from "./cont
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
-import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs, readLsp } from "../util/state.js";
 import {
   emptyExtractCache,
   readExtractCache,
@@ -39,7 +39,7 @@ import { readGraph, writeGraph, wiringPath } from "./write.js";
 import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
 import { discoverScopes, scopeOf } from "./scopes.js";
-import type { GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
+import type { EdgeV1, GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
 import type { CruxSummarizer } from "../ai/crux.js";
 
 export { listSourceFiles } from "./source-files.js";
@@ -83,7 +83,11 @@ export interface GraphBuildOptions {
   /** Opt-in compiler-grade edge enrichment via a language server (`graft build
    * --lsp`): adds `lsp_resolved` call edges the AST resolver couldn't (member
    * calls, breadth-tier calls). Off by default — needs a server on PATH and is
-   * slower; the graph is fully functional without it. */
+   * slower; the graph is fully functional without it.
+   *
+   * Absent falls back to the repo's persisted choice (`.graft/config.json`), so
+   * the refresh behind a query — which threads no CLI flags — keeps the edges a
+   * `--lsp` build added instead of dropping them on the next edit. */
   lsp?: boolean;
   /** Run the Tier-2 LLM meaning pass. Absent → Tier-1 only (cache is still preserved). */
   summarizer?: CruxSummarizer;
@@ -148,6 +152,38 @@ function readGoModules(root: string, repoFiles: string[]): GoModule[] {
   return mods;
 }
 
+/**
+ * Copy the previous build's `lsp_resolved` edges forward for files that did not
+ * change, so an incremental build keeps compiler-grade edges it is not going to
+ * re-derive. An edge is carried only when BOTH endpoints still exist and its
+ * source file was not re-parsed — a changed file's edges are stale by
+ * definition and the enrichment pass re-derives them.
+ *
+ * Returns how many were carried, for the progress line.
+ */
+function carryLspEdges(
+  priorEdges: EdgeV1[] | undefined,
+  graph: GraphV1,
+  changedFiles: ReadonlySet<string>,
+): number {
+  if (!priorEdges?.length) return 0;
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  const present = new Set(graph.edges.map((e) => `${e.source}\0${e.relation}\0${e.target}`));
+  let carried = 0;
+  for (const e of priorEdges) {
+    if (e.confidence !== "lsp_resolved") continue;
+    const src = byId.get(e.source);
+    if (!src || !byId.has(e.target)) continue; // an endpoint was deleted or renamed
+    if (changedFiles.has(src.path)) continue; // re-derived by the pass below
+    const key = `${e.source}\0${e.relation}\0${e.target}`;
+    if (present.has(key)) continue; // the AST resolver reaches it now
+    graph.edges.push(e);
+    present.add(key);
+    carried++;
+  }
+  return carried;
+}
+
 export async function buildGraph(
   dir: string,
   opts: GraphBuildOptions = {},
@@ -187,6 +223,9 @@ export async function buildGraph(
   // fall out of both the cache and the fingerprint with no separate pruning pass.
   const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
   const entries: Record<string, ExtractEntry> = {};
+  /** Files re-parsed this run. The LSP pass below queries only these and
+   * carries the previous run's edges over for the rest. */
+  const changedFiles = new Set<string>();
   let parsed = 0;
   let reused = 0;
 
@@ -259,6 +298,7 @@ export async function buildGraph(
     }
 
     parsed++;
+    changedFiles.add(rel);
     try {
       const { nodes: fileNodes, rawEdges: fileEdges } = lang
         ? extractFile(rel, source, lang)
@@ -329,11 +369,30 @@ export async function buildGraph(
   // Opt-in compiler-grade enrichment (adds lsp_resolved call edges in place).
   // Runs on the assembled graph so callee positions map back to nodes; never
   // touches the extraction cache (Tier-1 stays pristine, cold==incremental).
-  if (opts.lsp) {
+  // An absent flag means "whatever this repo persisted", so an automatic
+  // refresh re-runs the enrichment a `--lsp` build opted into. `false` is
+  // explicit and always wins.
+  const wantLsp = opts.lsp ?? readLsp(root);
+  if (wantLsp) {
     const { enrichWithLsp } = await import("./lsp/enrich.js");
-    const r = await enrichWithLsp(graph, root);
+    // Incremental: a file whose bytes did not move has the same outgoing calls
+    // it had last run, so its `lsp_resolved` edges are copied forward and the
+    // server is asked only about what changed. Without this every automatic
+    // refresh would pay the full-repo enrichment (~12s on a 258-file repo),
+    // which is the reason the pass was previously confined to explicit builds.
+    // A cold build (no prior graph, or --no-reuse) carries nothing over and
+    // queries everything, so its output is unchanged.
+    const carried = carryLspEdges(prior?.edges, graph, changedFiles);
+    const r = await enrichWithLsp(graph, root, {
+      onlyFiles: opts.reuse === false || !prior ? undefined : changedFiles,
+    });
     graph.meta.edgeCount = graph.edges.length;
-    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
+    opts.onProgress?.({
+      phase: "enrich",
+      index: r.added + carried,
+      total: r.queried,
+      file: `lsp:${r.server ?? "none"}`,
+    });
   }
 
   const graphPath = writeGraph(graph, outDir);
