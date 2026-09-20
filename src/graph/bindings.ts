@@ -497,8 +497,85 @@ function handlePy(
     if (obj?.type === "identifier" && (obj.text === "self" || obj.text === "cls") && attr) {
       const typeName = callTypeName(right, aliases);
       if (typeName) bindings.set(classScope ?? scopePath, `self.${attr.text}`, typeName);
+      else {
+        // A homogeneous container of constructed objects — `nn.ModuleList([Blk()
+        // …])`, `nn.ModuleDict({k: FiLM(…) for …})`. The field itself is the
+        // container's (usually external) type, so it is NOT bound; what is known
+        // is the type of what comes OUT of it, recorded under a key no attribute
+        // can collide with so `self.layers.keys()` cannot pick it up. Read back
+        // by a subscripted call, `self.layers[i](x)`.
+        const elem = pyContainerElementType(right, aliases);
+        if (elem) bindings.set(classScope ?? scopePath, `self.${attr.text}[]`, elem);
+      }
     }
   }
+}
+
+/** Python container-literal node types whose ELEMENTS are worth typing. */
+const PY_CONTAINERS = new Set([
+  "list",
+  "set",
+  "tuple",
+  "dictionary",
+  "list_comprehension",
+  "set_comprehension",
+  "dictionary_comprehension",
+  "generator_expression",
+]);
+
+/**
+ * The single type every element of a container literal inside `value` is
+ * constructed from, or null.
+ *
+ * Only *direct elements* count — a list's items, a dict's values, a
+ * comprehension's body — never an arbitrary nested argument, so
+ * `nn.MaxPool2d(kernel_size=Size(3))` binds nothing. Elements must agree: a
+ * heterogeneous container has no one element type, and guessing one would be
+ * exactly the kind of invention this module refuses elsewhere.
+ */
+function pyContainerElementType(
+  value: Parser.SyntaxNode | null | undefined,
+  aliases: Map<string, string>,
+): string | null {
+  if (!value) return null;
+  const types = new Set<string>();
+  let sawElement = false;
+  const elementsOf = (container: Parser.SyntaxNode): Parser.SyntaxNode[] => {
+    if (container.type === "dictionary") {
+      return container.namedChildren
+        .filter((c) => c.type === "pair")
+        .map((p) => p.childForFieldName("value"))
+        .filter((n): n is Parser.SyntaxNode => !!n);
+    }
+    if (container.type === "dictionary_comprehension") {
+      const body = container.namedChildren[0];
+      const v = body?.type === "pair" ? body.childForFieldName("value") : null;
+      return v ? [v] : [];
+    }
+    if (
+      container.type === "list_comprehension" ||
+      container.type === "set_comprehension" ||
+      container.type === "generator_expression"
+    ) {
+      const body = container.namedChildren[0];
+      return body ? [body] : [];
+    }
+    return container.namedChildren;
+  };
+  const visit = (node: Parser.SyntaxNode): void => {
+    if (PY_CONTAINERS.has(node.type)) {
+      for (const el of elementsOf(node)) {
+        sawElement = true;
+        const t = callTypeName(el, aliases);
+        if (t) types.add(t);
+        else return; // an element that is not a plain constructor call → no single type
+      }
+      return;
+    }
+    for (const child of node.namedChildren) visit(child);
+  };
+  visit(value);
+  return sawElement && types.size === 1 ? [...types][0] : null;
 }
 
 function tsAnnotationTypeName(

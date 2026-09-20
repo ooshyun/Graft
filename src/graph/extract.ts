@@ -111,6 +111,12 @@ export interface RawEdge {
   /** 1-based line of the syntax node that produced this edge, for quoting the
    * real site rather than the first line whose text happens to name the symbol. */
   line?: number;
+  /** calls with viaMember: the type bound to the receiver-qualified NAME itself
+   * (`self.film` in `self.film(x)`, from `self.film = FiLM(...)`) — i.e. the
+   * callee is a stored instance, not a method. Used only as a fallback once the
+   * owner-qualified method lookup finds nothing, so a real method of that name
+   * always wins. See resolve.ts's calls branch. */
+  boundType?: string;
   /** calls: the number of arguments at the CALL SITE. Only emitted for languages
    * with overloading (Java, Swift), where a same-named sibling on the same class is
    * otherwise indistinguishable — and picking wrong turns a delegating overload
@@ -779,7 +785,39 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         });
       } else {
         const recvType = resolveRecvType(callee.receiver, ctx);
-        edges.push(recvType ? { ...callEdge, recvType } : callEdge);
+        // Calling a stored instance rather than a method: `self.film(x)` where
+        // `self.film = FiLM(...)`. The name is a FIELD, so no method of the
+        // enclosing class matches it and the edge would be dropped — yet the
+        // dependency is real and the binding table already knows the type. Carry
+        // it as a fallback (resolve.ts tries the method first, so a class with
+        // both a field and a method of one name still resolves to the method).
+        // Normalized to `self.` the way resolveRecvType does, so TS's `this.x()`
+        // shares the path.
+        const fieldBase =
+          callee.viaMember && callee.receiver
+            ? `${callee.receiver === "this" ? "self" : callee.receiver.replace(/^this\./, "self.")}.${callee.name}`
+            : null;
+        // A subscripted call reads the container's ELEMENT type, kept under a
+        // separate key so an ordinary `self.layers.foo()` can never see it.
+        const fieldKey = fieldBase && callee.viaSubscript ? `${fieldBase}[]` : fieldBase;
+        const boundType = fieldKey ? ctx.bindings.lookup(ctx.scope, fieldKey) : null;
+        const withRecv = recvType ? { ...callEdge, recvType } : callEdge;
+        // A member call carries no specifier of its own (that is the bare-call
+        // import path above), so the slot is free to name where the BOUND TYPE
+        // came from. Without it a bound type the repo defines twice — two
+        // `FiLM`s, the case this whole fallback exists for — would resolve
+        // ambiguously and drop, even though this file's import already said
+        // which one it holds.
+        const boundImport = boundType ? ctx.importedSymbols.get(boundType) : undefined;
+        edges.push(
+          boundType
+            ? {
+                ...withRecv,
+                boundType: boundImport?.name ?? boundType,
+                ...(boundImport ? { specifier: boundImport.specifier } : {}),
+              }
+            : withRecv,
+        );
       }
     }
   } else if (ctx.lang === "php" && node.type === "use_declaration") {
@@ -2254,7 +2292,7 @@ function javaTypeParameterNames(decl: Parser.SyntaxNode): ReadonlySet<string> {
 function calleeName(
   node: Parser.SyntaxNode,
   lang: Language,
-): { name: string; viaMember: boolean; receiver?: string; kinds?: Kind[] } | null {
+): { name: string; viaMember: boolean; receiver?: string; kinds?: Kind[]; viaSubscript?: boolean } | null {
   // Java first: `method_invocation` has NO `function` field (it splits the callee
   // into `object` + `name`), so the shared lookup below would return null for every
   // Java call site and the language would extract nodes with no call edges at all.
@@ -2345,6 +2383,18 @@ if (lang === "kotlin") {
   if (lang === "python" && fn.type === "attribute") {
     const a = fn.childForFieldName("attribute") ?? fn.namedChildren.at(-1);
     return a ? { name: a.text, viaMember: true, receiver: pyReceiver(fn) } : null;
+  }
+  if (lang === "python" && fn.type === "subscript") {
+    // `self.blocks[i](x)` / `self.layers[key](x)` — calling an element OUT of a
+    // container field. The called name is not in the source at all (the index
+    // picks it at runtime), so this resolves only through the container's
+    // recorded element type; `viaSubscript` tells the caller to look that up.
+    // The index expression is deliberately ignored: which element is irrelevant
+    // when they all share a type, and unknowable when they do not.
+    const value = fn.childForFieldName("value");
+    if (value?.type !== "attribute") return null;
+    const a = value.childForFieldName("attribute") ?? value.namedChildren.at(-1);
+    return a ? { name: a.text, viaMember: true, receiver: pyReceiver(value), viaSubscript: true } : null;
   }
   if (lang === "go" && fn.type === "selector_expression") {
     // `pkg.Fn()` / `recv.Method()` — the called name is the trailing field.

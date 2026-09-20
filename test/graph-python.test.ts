@@ -290,3 +290,117 @@ test("Python: a bare call with no import naming it still drops when ambiguous", 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * Calls through a stored instance (F2). `self.film(x)` where
+ * `self.film = FiLM(...)` is not a method call — the name is a field — so the
+ * owner-qualified lookup finds nothing and the edge used to be dropped, even
+ * though the binding table already knew the type. These pin the fallback and
+ * the two ways it must NOT fire.
+ */
+
+const INSTANCE_FIELD = `import torch.nn as nn
+
+from pkg.thing import Widget
+
+
+class Holder:
+    def __init__(self, n):
+        self.w = Widget()
+        self.layers = [Widget(), Widget()]
+        self.mods = nn.ModuleDict({f"k{i}": Widget() for i in range(n)})
+        self.mixed = [Widget(), object()]
+
+    def run(self):
+        return self.w()
+
+    def run_indexed(self, i):
+        return self.layers[i]()
+
+    def run_dict(self, k):
+        return self.mods[k]()
+
+    def run_mixed(self, i):
+        return self.mixed[i]()
+
+    def keys(self):
+        return self.layers.keys()
+`;
+
+/** A class with BOTH a field and a method of one name — the method must win. */
+const FIELD_VS_METHOD = `from pkg.thing import Widget
+
+
+class Both:
+    def __init__(self):
+        self.run = Widget()
+
+    def run(self):
+        return 1
+
+    def go(self):
+        return self.run()
+`;
+
+test("Python: calling a bound instance field resolves to the field's class", async () => {
+  const dir = makeFixture();
+  try {
+    writeFileSync(join(dir, "holder.py"), INSTANCE_FIELD);
+    const graph = await buildFixture(dir);
+    const calls = graph.edges.filter((e) => e.relation === "calls");
+    assert.ok(
+      calls.some((e) => e.source === "holder.py#Holder.run" && e.target === "pkg/thing.py#Widget"),
+      "self.w() should reach Widget, the type self.w was constructed from",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Python: a subscripted call resolves through the container's element type", async () => {
+  const dir = makeFixture();
+  try {
+    writeFileSync(join(dir, "holder.py"), INSTANCE_FIELD);
+    const graph = await buildFixture(dir);
+    const calls = graph.edges.filter((e) => e.relation === "calls");
+    assert.ok(
+      calls.some((e) => e.source === "holder.py#Holder.run_indexed" && e.target === "pkg/thing.py#Widget"),
+      "self.layers[i]() should reach Widget through the homogeneous container",
+    );
+    assert.ok(
+      calls.some((e) => e.source === "holder.py#Holder.run_dict" && e.target === "pkg/thing.py#Widget"),
+      "a dict comprehension inside a container constructor types its values too",
+    );
+    // A heterogeneous container has no single element type — nothing to resolve.
+    assert.ok(
+      !calls.some((e) => e.source === "holder.py#Holder.run_mixed" && e.target === "pkg/thing.py#Widget"),
+      "a mixed container must not be typed by its first element",
+    );
+    // The element type is kept under its own key, so an ordinary attribute call
+    // on the container itself cannot pick it up.
+    assert.ok(
+      !calls.some((e) => e.source === "holder.py#Holder.keys" && e.target === "pkg/thing.py#Widget"),
+      "self.layers.keys() is a call on the container, not on an element",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Python: a real method outranks a same-named instance field", async () => {
+  const dir = makeFixture();
+  try {
+    writeFileSync(join(dir, "both.py"), FIELD_VS_METHOD);
+    const graph = await buildFixture(dir);
+    const targets = graph.edges
+      .filter((e) => e.relation === "calls" && e.source === "both.py#Both.go")
+      .map((e) => e.target);
+    assert.ok(targets.some((t) => t.startsWith("both.py#Both.run")), "self.run() resolves to the method");
+    assert.ok(
+      !targets.includes("pkg/thing.py#Widget"),
+      "the field fallback must not fire while a method of that name matches",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

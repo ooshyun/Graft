@@ -32,6 +32,10 @@ const PY_CTOR_KINDS: Kind[] = ["class"];
  * not arise: whichever of the two that file exports under the name is the target.
  * Callable values only — a call is never to a plain variable. */
 const IMPORTED_CALL_KINDS: Kind[] = ["function", "class", "method"];
+/** What a call through a stored instance (`self.film(x)`) may target: the type
+ * the field was bound to. Nominal kinds only — the binding records a
+ * constructor's name, never a function's. */
+const BOUND_INSTANCE_KINDS: Kind[] = ["class", "struct", "interface"];
 /** Swift is Python's case with more nominal kinds: `Animal(legs: 4)` is an ordinary
  * call node with no `new` to mark construction, and struct/enum initializers are as
  * routine as class ones (a struct gets a memberwise init for free). Same fallback
@@ -302,6 +306,40 @@ export function resolveEdges(
         if (hit === "ambiguous") continue; // drop — never guess past an ambiguous owner
         if (hit) {
           add(e.source, hit.id, "calls", hit.confidence, e.line);
+          continue;
+        }
+        // No method of that name on the receiver's type — but the name may be a
+        // FIELD holding an instance, which is what `self.film(x)` calls when
+        // `self.film = FiLM(...)`. In Python that dispatches through the
+        // instance's own type (`__call__`, and for a torch module its
+        // `forward`), so the dependency is on that class. The binding is
+        // syntax-local and states the type outright, so this is not the
+        // name-guessing fallback #35 measured: it fires only for a receiver
+        // whose field type was read off an assignment in this file, and only
+        // after a real method has failed to match.
+        if (e.boundType) {
+          // Scoped to the module the type was imported from when the extractor
+          // recorded one, exactly as a bare imported call is above — otherwise a
+          // type two files define drops, and a repo with two same-named classes
+          // is precisely where a field's declared type is worth having.
+          const boundFile = e.specifier
+            ? PY_EXT.test(e.file)
+              ? resolvePythonImport(e.specifier, e.file, byId, pyFilesBySuffix)
+              : resolveImport(e.specifier, e.file, byId)
+            : null;
+          const scoped =
+            boundFile && byId.has(boundFile)
+              ? (perFileName.get(boundFile)?.get(e.boundType) ?? []).filter((n) =>
+                  BOUND_INSTANCE_KINDS.includes(n.kind),
+                )
+              : [];
+          const bound =
+            scoped.length === 1
+              ? { id: scoped[0].id, confidence: "extracted" as const }
+              : resolveName(e.boundType, e.file, BOUND_INSTANCE_KINDS, perFileName, globalName);
+          if (bound && bound.id !== e.source) {
+            add(e.source, bound.id, "calls", bound.confidence, e.line);
+          }
           continue;
         }
         // No owner-qualified match means the call is unresolved. A unique bare
