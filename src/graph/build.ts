@@ -20,6 +20,7 @@ import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/no
 import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import { configLangOf, extractConfig } from "./config.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
@@ -252,7 +253,11 @@ export async function buildGraph(
     // breadth tier so a future grammar claiming .vue can't shadow it.
     const container = lang ? null : containerLangOf(f.abs);
     const generic = lang || container ? null : genericLangOf(f.abs);
-    const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
+    // Last: a grammar always wins over the config tier, so a format that later
+    // gains one (a tags.scm for TOML, say) keeps its symbols.
+    const config = lang || container || generic ? null : configLangOf(f.abs);
+    const label =
+      languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? config?.name ?? "unknown";
     const cached = priorExtract.files[rel];
 
     // Every file is read and hashed, every build — only the *parse* is memoized.
@@ -304,7 +309,9 @@ export async function buildGraph(
         ? extractFile(rel, source, lang)
         : container
           ? extractContainer(rel, source, container)
-          : extractGeneric(rel, source, generic!.name);
+          : config
+            ? extractConfig(rel, source, config)
+            : extractGeneric(rel, source, generic!.name);
       nodes.push(...fileNodes);
       rawEdges.push(...fileEdges);
       sources.set(rel, source);

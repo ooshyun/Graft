@@ -36,6 +36,19 @@ const IMPORTED_CALL_KINDS: Kind[] = ["function", "class", "method"];
  * the field was bound to. Nominal kinds only — the binding records a
  * constructor's name, never a function's. */
 const BOUND_INSTANCE_KINDS: Kind[] = ["class", "struct", "interface"];
+/** What a dotted path in a config value may name. Any top-level definition: a
+ * component selector usually names a class, but a factory function
+ * (`pkg.build.make_model`) is the same kind of wiring. */
+const DOTTED_TARGET_KINDS: Kind[] = [
+  "class",
+  "function",
+  "interface",
+  "struct",
+  "enum",
+  "type",
+  "constant",
+  "module",
+];
 /** Swift is Python's case with more nominal kinds: `Animal(legs: 4)` is an ordinary
  * call node with no `new` to mark construction, and struct/enum initializers are as
  * routine as class ones (a struct gets a memberwise init for free). Same fallback
@@ -255,6 +268,31 @@ export function resolveEdges(
       const hit = resolveName(e.name!, e.file, kinds, perFileName, globalName);
       // an unresolved base is usually an external/imported type — keep the name.
       add(e.source, hit?.id ?? e.name!, e.relation, hit?.confidence ?? "inferred");
+    } else if (e.relation === "references" && e.dotted && e.name) {
+      // A dotted path out of a string: `pkg.mod.Symbol`, or `pkg.mod` naming a
+      // module outright. Both splits are tried — symbol-in-module first, since
+      // that is the shape a component selector takes — and an edge is emitted
+      // only if one of them lands on something this repo actually defines.
+      // Nothing is guessed: a path that names no in-repo module, or a module
+      // that has no such symbol, produces no edge at all, which is what keeps
+      // `torch.nn.Module` and a dotted word in prose from becoming wiring.
+      const parts = e.name.split(".");
+      const modulePath = parts.slice(0, -1).join(".");
+      const symbol = parts[parts.length - 1];
+      const moduleFile = resolvePythonImport(modulePath, e.file, byId, pyFilesBySuffix);
+      let hit: string | null = null;
+      if (byId.has(moduleFile)) {
+        const cands = (perFileName.get(moduleFile)?.get(symbol) ?? []).filter((n) =>
+          DOTTED_TARGET_KINDS.includes(n.kind),
+        );
+        if (cands.length === 1) hit = cands[0].id;
+      }
+      if (!hit) {
+        // The whole path may name a module rather than a symbol in one.
+        const whole = resolvePythonImport(e.name, e.file, byId, pyFilesBySuffix);
+        if (byId.has(whole)) hit = whole;
+      }
+      if (hit && hit !== e.source) add(e.source, hit, "references", "string_ref", e.line);
     } else if (e.relation === "references" && e.name) {
       if (e.specifier) {
         // A named import gives both halves needed for sound resolution: the module

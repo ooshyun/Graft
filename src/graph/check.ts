@@ -23,6 +23,7 @@ import { contextDirFor } from "../context/node-file.js";
 import { extractFile, languageOf } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import { configLangOf, extractConfig } from "./config.js";
 import { listSourceFiles } from "./build.js";
 import { readGraph, wiringPath } from "./write.js";
 import { readFingerprint } from "./fingerprint.js";
@@ -99,13 +100,14 @@ export async function checkGraph(
   );
   const current = new Map<string, string>(); // id → body_hash
   for (const file of sourceFiles) {
-    // The same three-way branch `buildGraph` uses, in the same order. The two must
+    // The same four-way branch `buildGraph` uses, in the same order. The two must
     // stay in step: a tier the build extracts and the check cannot see reports as
     // `removed` forever, and the `graft build` the check tells you to run can never
     // repair it.
     const lang = languageOf(file);
     const container = lang ? null : containerLangOf(file);
     const generic = lang || container ? null : genericLangOf(file);
+    const config = lang || container || generic ? null : configLangOf(file);
     let source: string | null;
     try {
       source = readSourceFile(file);
@@ -121,7 +123,9 @@ export async function checkGraph(
           ? extractContainer(rel, source, container)
           : generic
             ? extractGeneric(rel, source, generic.name)
-            : null;
+            : config
+              ? extractConfig(rel, source, config)
+              : null;
       // No tier claims this file. Spelled out rather than asserted away: the
       // `generic!` that used to stand in this position threw a TypeError on a
       // container-tier file, the catch below swallowed it as a parse failure, and

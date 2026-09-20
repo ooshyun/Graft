@@ -111,6 +111,12 @@ export interface RawEdge {
   /** 1-based line of the syntax node that produced this edge, for quoting the
    * real site rather than the first line whose text happens to name the symbol. */
   line?: number;
+  /** references: `name` is a DOTTED MODULE PATH (`pkg.mod.Symbol`) read out of a
+   * string — a config value, or an argument to a dynamic import. Resolved by
+   * splitting the path rather than by the usual name index, and independently of
+   * the extension of the file it was found in, since a `.json` has no language
+   * of its own. See resolve.ts's dotted branch. */
+  dotted?: boolean;
   /** calls with viaMember: the type bound to the receiver-qualified NAME itself
    * (`self.film` in `self.film(x)`, from `self.film = FiLM(...)`) — i.e. the
    * callee is a stored instance, not a method. Used only as a fallback once the
@@ -818,6 +824,28 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
               }
             : withRecv,
         );
+      }
+    }
+  } else if (ctx.lang === "python" && node.type === "string") {
+    // A dotted module path written as a string — the other half of the config
+    // tier, for the frameworks that keep their wiring in Python itself
+    // (Django's `INSTALLED_APPS`, a Celery task path, an `import_attr(...)`
+    // argument). Same contract as config.ts: the path is only a candidate, and
+    // resolve.ts emits an edge just for one that names a real in-repo module
+    // and symbol, so prose and third-party paths fall away.
+    //
+    // Docstrings are skipped. A lone string statement is documentation, and a
+    // module path named in prose describes rather than wires.
+    if (!isDocstring(node)) {
+      for (const path of dottedStringPaths(node.text)) {
+        edges.push({
+          source: ctx.parentId,
+          relation: "references",
+          name: path,
+          dotted: true,
+          file: ctx.rel,
+          line: node.startPosition.row + 1,
+        });
       }
     }
   } else if (ctx.lang === "php" && node.type === "use_declaration") {
@@ -2607,6 +2635,22 @@ if (lang === "kotlin") return node.type === "import_header";
   if (lang === "php") return node.type === "namespace_use_clause";
   return node.type === "import_statement" || node.type === "import_from_statement";
 }
+
+/** A string statement standing alone is a docstring — the module's, a class's or
+ * a function's — rather than a value the program uses. */
+function isDocstring(node: Parser.SyntaxNode): boolean {
+  return node.parent?.type === "expression_statement";
+}
+
+/** Dotted module paths inside a Python string literal's text. Shares config.ts's
+ * shape rule (three or more identifier segments), applied to the raw token, so
+ * the surrounding quotes and any prefix never matter. */
+function dottedStringPaths(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(PY_DOTTED_IN_STRING)) out.add(m[0]);
+  return [...out];
+}
+const PY_DOTTED_IN_STRING = /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){2,}\b(?!\.)/g;
 
 function importSpecifier(node: Parser.SyntaxNode, lang: Language): string | null {
   if (lang === "php") {

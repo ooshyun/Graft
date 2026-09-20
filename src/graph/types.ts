@@ -35,9 +35,19 @@ export type Kind =
  * resolver assigns `extracted`/`inferred`; the opt-in LSP enrichment pass
  * (`graft build --lsp`) can promote an edge to compiler-grade `lsp_resolved`
  * (an exact server-confirmed target) or `lsp_dispatch` (an interface/virtual
- * candidate). Order matters: consumers that rank by provenance treat earlier
- * values as stronger. */
-export type Confidence = "lsp_resolved" | "lsp_dispatch" | "extracted" | "inferred";
+ * candidate); the config tier emits `string_ref`. Order matters: consumers that
+ * rank by provenance treat earlier values as stronger. */
+export type Confidence =
+  | "lsp_resolved"
+  | "lsp_dispatch"
+  | "extracted"
+  | "inferred"
+  /** The target was named by a dotted module path in a string — a config value
+   * or a dynamic-import argument — and that path resolved to a real module and
+   * symbol in this repo. Weaker than `extracted` because the string is not
+   * checked by any compiler; stronger than a name guess because it states the
+   * module, not just the name. */
+  | "string_ref";
 
 /** Whether the LLM meaning-layer has been computed for a node. */
 export type SummaryState = "pending" | "ready" | "stale";
@@ -68,7 +78,7 @@ export interface NodeV1 {
   // How the node was extracted. "ast" = a first-class hand-written extractor
   // (TS/JS/Python/Go, full-fidelity). "generic" = the tags.scm breadth tier
   // (signature-only; symbols + bare edges, no scope-aware binding).
-  origin: "ast" | "generic";
+  origin: "ast" | "generic" | "config";
   body_hash: string; // sha256 of the definition text; the Tier-2 re-run trigger
   chars?: number; // byte length of the WHOLE file (file nodes only); the baseline
   //                 `ask` uses to estimate tokens saved vs reading the file whole
